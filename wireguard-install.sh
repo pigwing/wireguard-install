@@ -114,6 +114,176 @@ function getHomeDirForClient() {
 	echo "$HOME_DIR"
 }
 
+function ipv4ToInt() {
+	local IPV4=$1
+	local OCTET_1
+	local OCTET_2
+	local OCTET_3
+	local OCTET_4
+
+	IFS='.' read -r OCTET_1 OCTET_2 OCTET_3 OCTET_4 <<<"${IPV4}"
+	echo $(((OCTET_1 << 24) + (OCTET_2 << 16) + (OCTET_3 << 8) + OCTET_4))
+}
+
+function intToIpv4() {
+	local IPV4_INT=$1
+
+	echo "$(((IPV4_INT >> 24) & 255)).$(((IPV4_INT >> 16) & 255)).$(((IPV4_INT >> 8) & 255)).$((IPV4_INT & 255))"
+}
+
+function cidrMask() {
+	local PREFIX=$1
+
+	if [[ ${PREFIX} -eq 0 ]]; then
+		echo 0
+	else
+		echo $(((0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF))
+	fi
+}
+
+function ipv4CidrContains() {
+	local IPV4=$1
+	local CIDR=$2
+	local NETWORK=${CIDR%/*}
+	local PREFIX=${CIDR#*/}
+	local MASK
+
+	MASK=$(cidrMask "${PREFIX}")
+	[[ $(( $(ipv4ToInt "${IPV4}") & MASK )) -eq $(( $(ipv4ToInt "${NETWORK}") & MASK )) ]]
+}
+
+function getClientIpv4Cidr() {
+	local ALLOWED_IP
+	local SERVER_IPV4_PREFIX
+
+	for ALLOWED_IP in ${ALLOWED_IPS//,/ }; do
+		if [[ ${ALLOWED_IP} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ && ${ALLOWED_IP} != "0.0.0.0/0" ]] && ipv4CidrContains "${SERVER_WG_IPV4}" "${ALLOWED_IP}"; then
+			echo "${ALLOWED_IP}"
+			return
+		fi
+	done
+
+	SERVER_IPV4_PREFIX=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1"."$2"."$3 }')
+	echo "${SERVER_IPV4_PREFIX}.0/24"
+}
+
+function getClientIpv4ForSequence() {
+	local CLIENT_SEQUENCE=$1
+	local SERVER_IPV4_PREFIX
+	local BASE_IPV4_INT
+	local CLIENT_IPV4_INT
+	local SUBNET_OFFSET
+	local HOST_OFFSET
+	local CLIENT_IPV4
+	local CLIENT_IPV4_CIDR
+
+	if [[ ! ${CLIENT_SEQUENCE} =~ ^[0-9]+$ || ${CLIENT_SEQUENCE} -lt 2 ]]; then
+		return 1
+	fi
+
+	SERVER_IPV4_PREFIX=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1"."$2"."$3 }')
+	BASE_IPV4_INT=$(ipv4ToInt "${SERVER_IPV4_PREFIX}.0")
+
+	if [[ ${CLIENT_SEQUENCE} -le 254 ]]; then
+		CLIENT_IPV4_INT=$((BASE_IPV4_INT + CLIENT_SEQUENCE))
+	else
+		SUBNET_OFFSET=$((1 + (CLIENT_SEQUENCE - 255) / 254))
+		HOST_OFFSET=$((1 + (CLIENT_SEQUENCE - 255) % 254))
+		CLIENT_IPV4_INT=$((BASE_IPV4_INT + (SUBNET_OFFSET * 256) + HOST_OFFSET))
+	fi
+
+	CLIENT_IPV4=$(intToIpv4 "${CLIENT_IPV4_INT}")
+	CLIENT_IPV4_CIDR=$(getClientIpv4Cidr)
+	if ! ipv4CidrContains "${CLIENT_IPV4}" "${CLIENT_IPV4_CIDR}"; then
+		return 1
+	fi
+
+	echo "${CLIENT_IPV4}"
+}
+
+function getClientSequenceForIpv4() {
+	local CLIENT_IPV4=$1
+	local SERVER_IPV4_PREFIX
+	local BASE_IPV4_INT
+	local CLIENT_IPV4_INT
+	local CLIENT_IPV4_DIFF
+	local SUBNET_OFFSET
+	local HOST_OFFSET
+	local CLIENT_IPV4_CIDR
+
+	if [[ ! ${CLIENT_IPV4} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		return 1
+	fi
+
+	CLIENT_IPV4_CIDR=$(getClientIpv4Cidr)
+	if ! ipv4CidrContains "${CLIENT_IPV4}" "${CLIENT_IPV4_CIDR}"; then
+		return 1
+	fi
+
+	SERVER_IPV4_PREFIX=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1"."$2"."$3 }')
+	BASE_IPV4_INT=$(ipv4ToInt "${SERVER_IPV4_PREFIX}.0")
+	CLIENT_IPV4_INT=$(ipv4ToInt "${CLIENT_IPV4}")
+	CLIENT_IPV4_DIFF=$((CLIENT_IPV4_INT - BASE_IPV4_INT))
+
+	if [[ ${CLIENT_IPV4_DIFF} -lt 2 ]]; then
+		return 1
+	fi
+
+	SUBNET_OFFSET=$((CLIENT_IPV4_DIFF / 256))
+	HOST_OFFSET=$((CLIENT_IPV4_DIFF % 256))
+	if [[ ${HOST_OFFSET} -lt 1 || ${HOST_OFFSET} -gt 254 ]]; then
+		return 1
+	fi
+
+	if [[ ${SUBNET_OFFSET} -eq 0 ]]; then
+		echo "${HOST_OFFSET}"
+	else
+		echo $((255 + ((SUBNET_OFFSET - 1) * 254) + HOST_OFFSET - 1))
+	fi
+}
+
+function getNextClientDotIp() {
+	local CLIENT_IPV4
+	local CLIENT_SEQUENCE
+	local NEXT_DOT_IP
+
+	NEXT_DOT_IP=2
+	while read -r CLIENT_IPV4; do
+		CLIENT_SEQUENCE=$(getClientSequenceForIpv4 "${CLIENT_IPV4%/32}") || continue
+		if [[ ${CLIENT_SEQUENCE} -ge ${NEXT_DOT_IP} ]]; then
+			NEXT_DOT_IP=$((CLIENT_SEQUENCE + 1))
+		fi
+	done < <(grep -o -E "([0-9]{1,3}\.){3}[0-9]{1,3}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf" 2>/dev/null)
+
+	echo "${NEXT_DOT_IP}"
+}
+
+function initializeParamsDefaults() {
+	if [[ -z ${CLIENT_PERSISTENT_KEEPALIVE+x} || ! ${CLIENT_PERSISTENT_KEEPALIVE} =~ ^[0-9]+$ ]]; then
+		CLIENT_PERSISTENT_KEEPALIVE=25
+	fi
+
+	if [[ -z ${NEXT_CLIENT_DOT_IP+x} || ! ${NEXT_CLIENT_DOT_IP} =~ ^[0-9]+$ ]]; then
+		NEXT_CLIENT_DOT_IP=$(getNextClientDotIp)
+	fi
+}
+
+function saveWireGuardParams() {
+	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
+SERVER_PUB_NIC=${SERVER_PUB_NIC}
+SERVER_WG_NIC=${SERVER_WG_NIC}
+SERVER_WG_IPV4=${SERVER_WG_IPV4}
+SERVER_WG_IPV6=${SERVER_WG_IPV6}
+SERVER_PORT=${SERVER_PORT}
+SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
+SERVER_PUB_KEY=${SERVER_PUB_KEY}
+CLIENT_DNS_1=${CLIENT_DNS_1}
+CLIENT_DNS_2=${CLIENT_DNS_2}
+ALLOWED_IPS=${ALLOWED_IPS}
+CLIENT_PERSISTENT_KEEPALIVE=${CLIENT_PERSISTENT_KEEPALIVE}
+NEXT_CLIENT_DOT_IP=${NEXT_CLIENT_DOT_IP}" >/etc/wireguard/params
+}
+
 function initialCheck() {
 	isRoot
 	checkOS
@@ -242,19 +412,11 @@ function installWireGuard() {
 
 	SERVER_PRIV_KEY=$(wg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
+	CLIENT_PERSISTENT_KEEPALIVE=25
+	NEXT_CLIENT_DOT_IP=2
 
 	# Save WireGuard settings
-	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
-SERVER_PUB_NIC=${SERVER_PUB_NIC}
-SERVER_WG_NIC=${SERVER_WG_NIC}
-SERVER_WG_IPV4=${SERVER_WG_IPV4}
-SERVER_WG_IPV6=${SERVER_WG_IPV6}
-SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
-SERVER_PUB_KEY=${SERVER_PUB_KEY}
-CLIENT_DNS_1=${CLIENT_DNS_1}
-CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
+	saveWireGuardParams
 
 	# Add server interface
 	echo "[Interface]
@@ -360,24 +522,29 @@ function newClient() {
 		fi
 	done
 
-	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-		if [[ ${DOT_EXISTS} == '0' ]]; then
-			break
-		fi
-	done
-
-	if [[ ${DOT_EXISTS} == '1' ]]; then
+	CLIENT_SEQUENCE=${NEXT_CLIENT_DOT_IP}
+	DEFAULT_CLIENT_WG_IPV4=$(getClientIpv4ForSequence "${CLIENT_SEQUENCE}")
+	if [[ -z ${DEFAULT_CLIENT_WG_IPV4} ]]; then
 		echo ""
-		echo "The subnet configured supports only 253 clients."
+		echo "The configured AllowedIPs IPv4 subnet does not have room for more clients."
 		exit 1
 	fi
 
-	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
-	until [[ ${IPV4_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
-		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	until [[ ${IPV4_EXISTS} == '0' && ${CLIENT_IPV4_VALID} == '1' ]]; do
+		read -rp "Client WireGuard IPv4: " -e -i "${DEFAULT_CLIENT_WG_IPV4}" CLIENT_WG_IPV4
+		CLIENT_IPV4_VALID=0
+		CLIENT_SEQUENCE=$(getClientSequenceForIpv4 "${CLIENT_WG_IPV4}") || CLIENT_SEQUENCE=0
+
+		if [[ ${CLIENT_SEQUENCE} -ge ${NEXT_CLIENT_DOT_IP} ]]; then
+			CLIENT_IPV4_VALID=1
+			IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		else
+			IPV4_EXISTS=1
+			echo ""
+			echo -e "${ORANGE}Client IPv4 must be inside $(getClientIpv4Cidr), must not be a network or broadcast address, and must be at or after ${DEFAULT_CLIENT_WG_IPV4}.${NC}"
+			echo ""
+			continue
+		fi
 
 		if [[ ${IPV4_EXISTS} != 0 ]]; then
 			echo ""
@@ -387,17 +554,13 @@ function newClient() {
 	done
 
 	BASE_IP=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
-	until [[ ${IPV6_EXISTS} == '0' ]]; do
-		read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
-		CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
-		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-
-		if [[ ${IPV6_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
-			echo ""
-		fi
-	done
+	CLIENT_WG_IPV6="${BASE_IP}::${CLIENT_SEQUENCE}"
+	IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	if [[ ${IPV6_EXISTS} != 0 ]]; then
+		echo ""
+		echo -e "${ORANGE}A client with the specified IPv6 was already created. Please fix the existing configuration before adding this client.${NC}"
+		exit 1
+	fi
 
 	# Generate key pair for the client
 	CLIENT_PRIV_KEY=$(wg genkey)
@@ -421,7 +584,8 @@ DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+AllowedIPs = ${ALLOWED_IPS}
+PersistentKeepalive = ${CLIENT_PERSISTENT_KEEPALIVE}" >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -431,6 +595,8 @@ PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
 	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+	NEXT_CLIENT_DOT_IP=$((CLIENT_SEQUENCE + 1))
+	saveWireGuardParams
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
@@ -595,6 +761,8 @@ initialCheck
 # Check if WireGuard is already installed and load params
 if [[ -e /etc/wireguard/params ]]; then
 	source /etc/wireguard/params
+	initializeParamsDefaults
+	saveWireGuardParams
 	manageMenu
 else
 	installWireGuard
